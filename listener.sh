@@ -12,7 +12,7 @@ show_help()
 }
 
 # Простой греп из "free -mt" с формированием date, после чего все посчитанное будет писаться одной
-# строчкой в monitor.csv
+# строчкой в monitor_{date}.csv. Параметр $1 - название файла, в которое требуется писать.
 monitor()
 {
     TOTAL_MEM=$(free -mt | grep "Mem:" | awk '{print $3}')
@@ -20,25 +20,16 @@ monitor()
 
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
 
-    echo "$timestamp,$MEM" >> monitor.csv
-}
+    filename=$1
 
-# Простая проверка на супер пользователя, user_id=0 означает что мы под ним
-su_required()
-{
-    USER_ID=`id -u`
-
-    if [ "$USER_ID" != "0" ]; then
-        echo "Для корректной работы скрипта нужны права супер-пользователя!"
-        exit
-    fi
+    echo "$timestamp,$MEM" >> $filename
 }
 
 # Инициирует graceful-выход из демона, удаляя флаг-файл запуска процесса
 on_daemon_exit()
 {
-    if [ -e /var/run/listener.pid ]; then
-        rm -f /var/run/listener.pid
+    if [ -e ./tmp/listener.pid ]; then
+        rm -f ./tmp/listener.pid
     fi
 
     exit 0
@@ -47,8 +38,8 @@ on_daemon_exit()
 # Возвращает содержимое listener.pid флаг-файла
 daemon_pid()
 {
-    if [ -e /var/run/listener.pid ]; then
-        echo $(cat /var/run/listener.pid)
+    if [ -e ./tmp/listener.pid ]; then
+        echo $(cat ./tmp/listener.pid)
 
         return
     fi
@@ -57,11 +48,11 @@ daemon_pid()
 }
 
 # Проверяем тут, запускал ли кто-либо до нас процесс, пользуемся здесь тем, 
-# что созданный нами в фоне процесс (см. daemon_loop) будет откидывать в /var/run специальный файл,
+# что созданный нами в фоне процесс (см. daemon_loop) будет откидывать в ./tmp специальный файл,
 # в котором записан айди порожденного процесса
 daemon_running()
 {
-    if [ -e /var/run/listener.pid ]; then
+    if [ -e ./tmp/listener.pid ]; then
         echo "1"
         return
     fi
@@ -74,19 +65,14 @@ daemon_running()
 # и запускаем в фоне (посредством -l флага) демон-процесс
 start_daemon() 
 {
-    su_required
-
     if [ $(daemon_running) = "1" ]; then
         echo "Демон-процесс уже запущен..."
         exit 0
     fi
 
-    rm monitor.csv
-    touch monitor.csv
-
-    var1="Время"
-    var2="Утилизация памяти в Мб"
-    echo "$var1,$var2" >> monitor.csv
+    rm -rf tmp
+    mkdir tmp
+    rm monitor_*.csv
 
     echo "Запуск демон-процесса..."
     nohup bash $0 -l > /dev/null 2>&1 &
@@ -98,8 +84,6 @@ start_daemon()
 # Инициирует graceful-убийство процесса под pid=$daemon_pid, дожидаясь завершения этого процесса
 stop_daemon()
 {
-    su_required
-
     if [ $(daemon_running) = "0" ]; then
         echo "Демон-процесс уже деактивирован..."
         exit 0
@@ -109,36 +93,68 @@ stop_daemon()
 
     kill $(daemon_pid)
 
-    while [ -e /var/run/listener.pid ]; do
+    while [ -e ./tmp/listener.pid ]; do
         continue
     done
 }
 
-# Рутина, вызывающаяся посредством применения в программе флага -l, проверяет полномочия поьзователя и то,
-# что раньше процесс не был запущен, после чего пишет в директорию /var/run специальный файл, по которому
+# Рутина, вызывающаяся посредством применения в программе флага -l, проверяет,
+# что раньше процесс не был запущен, после чего пишет в директорию ./tmp специальный файл, по которому
 # скрипт будет понимать что процесс уже был ранее запущен кем-то. Далее, перенаправляет interrupt-сигналы 
 # на graceful-exit скрипты, который этот файлик будут очищать, после чего запускает монитор-цикл 
 daemon_loop()
 {
-    su_required
-
     if [ $(daemon_running) = "1" ]; then
         exit 0
     fi
 
-    echo "$$" > /var/run/listener.pid
+    echo "$$" > ./tmp/listener.pid
 
     trap 'on_daemon_exit' INT
     trap 'on_daemon_exit' QUIT
     trap 'on_daemon_exit' TERM
     trap 'on_daemon_exit' EXIT
 
-    while true; do
-        monitor
+    cur_date=$(date '+%F')
+    create_monitor_file "monitor_${cur_date}.csv"
 
-        # Мониторинг происходит каждые 5 секунд
-        sleep 5
+    while true; do
+        cur_date=$(check_if_recreation_needed_and_return_new_date $cur_date)
+
+        monitor "monitor_${cur_date}.csv"
+
+        # Мониторинг происходит каждые 10 секунд
+        sleep 10
     done
+}
+
+# Функция, которая принимает дату, с которой необходимо сравниться и возвращает дату файла, в который 
+# необходимо писать, создавая файл если текущая дата не совпадает с переданной
+check_if_recreation_needed_and_return_new_date() 
+{
+    saved_date=$1
+    cur_date=$(date '+%F')
+
+    if [[ $saved_date != $cur_date ]]; then
+        create_monitor_file "monitor_${cur_date}.csv"
+        echo $cur_date
+        return
+    fi
+
+    echo $saved_date
+    return
+}
+
+# Функция, необходимая чтобы создавать файлик мониторинга впервые и впоследующем при
+# истечении времени непрерывного мониторинга в один файл. Параметр $1 - название файла,
+# который необходимо создать и предварительно заполнить
+create_monitor_file()
+{
+    filename=$1
+    touch $filename
+    var1="Время"
+    var2="Утилизация памяти в Мб"
+    echo "$var1,$var2" >> $filename
 }
 
 # Инициирует проверку статуса демон-сабпроцесса по файлику, которым мы оперируем в данном скрипте,
